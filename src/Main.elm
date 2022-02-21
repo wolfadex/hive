@@ -140,6 +140,11 @@ update msg model =
 
 nectarExchangeSystem : Model -> Model
 nectarExchangeSystem model =
+    nectarExchangeSystemHelper { model | nectarExchange = List.reverse model.nectarExchange }
+
+
+nectarExchangeSystemHelper : Model -> Model
+nectarExchangeSystemHelper model =
     case model.nectarExchange of
         [] ->
             model
