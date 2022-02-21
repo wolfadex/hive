@@ -6,8 +6,10 @@ import Canvas
 import Canvas.Settings
 import Canvas.Settings.Line
 import Color
+import Html.Attributes exposing (id)
+import List exposing (maximum)
 import Logic.Component
-import Logic.Entity
+import Logic.Entity exposing (EntityID)
 import Logic.System
 import Time
 
@@ -26,9 +28,23 @@ type alias Model =
     { grid : Array Bool
     , position : Logic.Component.Set ( Int, Int )
     , flight : Logic.Component.Set Flight
-    , food : Logic.Component.Set Food
-    , goal : Logic.Component.Set (Maybe ( Int, Int ))
+    , nectar : Logic.Component.Set { has : Int, maximum : Int }
+    , nectarExchange : List NectarExchangeRequest
+    , goal : Logic.Component.Set Goal
+    , carrying : Logic.Component.Set (Maybe EntityID)
     }
+
+
+type alias NectarExchangeRequest =
+    { from : EntityID
+    , to : EntityID
+    , quantity : Int
+    }
+
+
+carryingSpec : Logic.Component.Spec (Maybe EntityID) Model
+carryingSpec =
+    Logic.Component.Spec .carrying (\comp world -> { world | carrying = comp })
 
 
 positionSpec : Logic.Component.Spec ( Int, Int ) Model
@@ -45,16 +61,17 @@ flightSpec =
     Logic.Component.Spec .flight (\comp world -> { world | flight = comp })
 
 
-type Food
-    = Food
+nectarSpec : Logic.Component.Spec { has : Int, maximum : Int } Model
+nectarSpec =
+    Logic.Component.Spec .nectar (\comp world -> { world | nectar = comp })
 
 
-foodSpec : Logic.Component.Spec Food Model
-foodSpec =
-    Logic.Component.Spec .food (\comp world -> { world | food = comp })
+type Goal
+    = NoGoal
+    | HasGoal (List ( Int, Int )) EntityID
 
 
-goalSpec : Logic.Component.Spec (Maybe ( Int, Int )) Model
+goalSpec : Logic.Component.Spec Goal Model
 goalSpec =
     Logic.Component.Spec .goal (\comp world -> { world | goal = comp })
 
@@ -62,30 +79,41 @@ goalSpec =
 init : () -> ( Model, Cmd Msg )
 init () =
     ( Logic.Entity.create 0 initialWorld
-        |> Logic.Entity.with ( positionSpec, ( 0, 0 ) )
+        |> Logic.Entity.with ( positionSpec, ( width // 2, height // 2 ) )
         |> Logic.Entity.with ( flightSpec, Flight )
-        |> Logic.Entity.with ( goalSpec, Nothing )
+        |> Logic.Entity.with ( goalSpec, NoGoal )
+        |> Logic.Entity.with ( nectarSpec, { has = 0, maximum = 10 } )
         |> Tuple.second
         |> Logic.Entity.create 1
         |> Logic.Entity.with ( positionSpec, ( 5, 5 ) )
-        |> Logic.Entity.with ( foodSpec, Food )
+        |> Logic.Entity.with ( nectarSpec, { has = 1000, maximum = 1000 } )
         |> Tuple.second
     , Cmd.none
     )
 
 
+width =
+    15
+
+
+height =
+    15
+
+
 initialWorld : Model
 initialWorld =
-    { grid = Array.initialize 1768 (\_ -> True)
+    { grid = Array.initialize (width * height) (\_ -> True)
     , position = Logic.Component.empty
     , flight = Logic.Component.empty
-    , food = Logic.Component.empty
+    , nectar = Logic.Component.empty
+    , nectarExchange = []
     , goal = Logic.Component.empty
+    , carrying = Logic.Component.empty
     }
 
 
 subscriptions : Model -> Sub Msg
-subscriptions model =
+subscriptions _ =
     Time.every 500 (\_ -> Tick)
 
 
@@ -102,43 +130,216 @@ update msg model =
 
         Tick ->
             ( model
-                |> goalSystem model positionSpec goalSpec
+                |> requestNectarSystem positionSpec goalSpec nectarSpec
+                |> nectarExchangeSystem
+                |> (\m -> goalSystem m positionSpec goalSpec m)
                 |> flightSystem positionSpec goalSpec flightSpec
             , Cmd.none
             )
 
 
-goalSystem : Model -> Logic.Component.Spec ( Int, Int ) Model -> Logic.Component.Spec (Maybe ( Int, Int )) Model -> Logic.System.System Model
+nectarExchangeSystem : Model -> Model
+nectarExchangeSystem model =
+    case model.nectarExchange of
+        [] ->
+            model
+
+        request :: rest ->
+            case
+                ( Logic.Component.get request.from model.nectar
+                , Logic.Component.get request.to model.nectar
+                )
+            of
+                ( Just nectarGiver, Just nectarReceiver ) ->
+                    let
+                        nectarToExhange : Int
+                        nectarToExhange =
+                            min request.quantity nectarGiver.has
+                                |> Debug.log "to exchange"
+                    in
+                    nectarExchangeSystem
+                        { model
+                            | nectar =
+                                model.nectar
+                                    |> Logic.Component.set request.from { nectarGiver | has = nectarGiver.has - nectarToExhange }
+                                    |> Logic.Component.set request.to { nectarReceiver | has = nectarReceiver.has + nectarToExhange }
+                            , nectarExchange = rest
+                        }
+
+                _ ->
+                    nectarExchangeSystem model
+
+
+requestNectarSystem :
+    Logic.Component.Spec ( Int, Int ) Model
+    -> Logic.Component.Spec Goal Model
+    -> Logic.Component.Spec { has : Int, maximum : Int } Model
+    -> Logic.System.System Model
+requestNectarSystem spec1 spec2 spec3 worldPrime =
+    Logic.System.indexedFoldl3
+        (\requesterId pos goal requesterNectar world ->
+            case ( requesterNectar.has < requesterNectar.maximum, goal ) of
+                ( True, HasGoal [] goalId ) ->
+                    case Logic.Component.get2 goalId world.position world.nectar of
+                        Nothing ->
+                            world
+
+                        Just ( goalPos, goalNectar ) ->
+                            if pos == goalPos && goalNectar.has > 0 then
+                                { world
+                                    | nectarExchange =
+                                        { from = goalId
+                                        , to = requesterId
+                                        , quantity =
+                                            (requesterNectar.maximum - requesterNectar.has)
+                                                |> Debug.log "request amount"
+                                        }
+                                            :: world.nectarExchange
+                                }
+
+                            else
+                                world
+
+                _ ->
+                    world
+        )
+        (spec1.get worldPrime)
+        (spec2.get worldPrime)
+        (spec3.get worldPrime)
+        worldPrime
+
+
+goalSystem :
+    Model
+    -> Logic.Component.Spec ( Int, Int ) Model
+    -> Logic.Component.Spec Goal Model
+    -> Logic.System.System Model
 goalSystem model =
     Logic.System.step2
         (\( pos, _ ) ( goal, setGoal ) ->
             case goal of
-                Just goalPos ->
-                    if pos == goalPos then
-                        setGoal Nothing
+                HasGoal _ _ ->
+                    identity
 
-                    else
-                        identity
+                NoGoal ->
+                    Logic.System.indexedFoldl2
+                        (\flowerId nectarPos nectar nearestGoal ->
+                            if nectar.has > 0 then
+                                case nearestGoal of
+                                    Nothing ->
+                                        Just ( nectarPos, flowerId )
 
-                Nothing ->
-                    Logic.System.foldl2
-                        (\foodPos _ nearestGoal ->
-                            case nearestGoal of
-                                Nothing ->
-                                    Just foodPos
+                                    Just ( nearestPos, _ ) ->
+                                        if distance pos nectarPos < distance pos nearestPos then
+                                            Just ( nectarPos, flowerId )
 
-                                Just nearestPos ->
-                                    if distance pos foodPos < distance pos nearestPos then
-                                        Just foodPos
+                                        else
+                                            nearestGoal
 
-                                    else
-                                        nearestGoal
+                            else
+                                nearestGoal
                         )
                         model.position
-                        model.food
+                        model.nectar
                         Nothing
+                        |> Maybe.map (\( nPos, id ) -> HasGoal (aStar pos nPos) id)
+                        |> Maybe.withDefault NoGoal
                         |> setGoal
         )
+
+
+aStar : ( Int, Int ) -> ( Int, Int ) -> List ( Int, Int )
+aStar (( x, y ) as startPos) goalPos =
+    aStarHelper startPos
+        goalPos
+        [ Tile
+            { g = 0
+            , h = distance startPos goalPos
+            , parent = Nothing
+            , x = x
+            , y = y
+            }
+        ]
+        []
+
+
+type alias TileData =
+    { g : Int
+    , h : Int
+    , parent : Maybe Tile
+    , x : Int
+    , y : Int
+    }
+
+
+type Tile
+    = Tile TileData
+
+
+aStarHelper : ( Int, Int ) -> ( Int, Int ) -> List Tile -> List Tile -> List ( Int, Int )
+aStarHelper startPos (( goalX, goalY ) as goalPos) openList closedList =
+    case openList of
+        [] ->
+            []
+
+        (Tile next) :: rest ->
+            let
+                neighbors : List Tile
+                neighbors =
+                    List.filterMap
+                        (\( x, y ) ->
+                            if
+                                (x < 0)
+                                    || (x > width)
+                                    || (y < 0)
+                                    || (y > height)
+                                    || List.any (\(Tile a) -> a.x == x && a.y == y) closedList
+                                    || List.any (\(Tile a) -> a.x == x && a.y == y) openList
+                            then
+                                Nothing
+
+                            else
+                                Just
+                                    (Tile
+                                        { g = next.g + 1
+                                        , h = distance ( next.x, next.y ) goalPos
+                                        , parent = Just (Tile next)
+                                        , x = x
+                                        , y = y
+                                        }
+                                    )
+                        )
+                        [ ( next.x - 1, next.y )
+                        , ( next.x + 1, next.y )
+                        , ( next.x - 1, next.y - 1 )
+                        , ( next.x + 1, next.y - 1 )
+                        , ( next.x, next.y + 1 )
+                        , ( next.x, next.y - 1 )
+                        ]
+
+                maybeGoalFound : List Tile
+                maybeGoalFound =
+                    List.filter (\(Tile a) -> a.x == goalX && a.y == goalY) neighbors
+            in
+            case maybeGoalFound of
+                [ goalFound ] ->
+                    rewind goalFound []
+
+                _ ->
+                    aStarHelper startPos
+                        goalPos
+                        (List.sortBy (\(Tile a) -> a.g + a.h) (neighbors ++ rest))
+                        (Tile next :: closedList)
+
+
+rewind : Tile -> List ( Int, Int ) -> List ( Int, Int )
+rewind (Tile tile) path =
+    case tile.parent of
+        Nothing ->
+            ( tile.x, tile.y ) :: path
+
+        Just x ->
+            rewind x (( tile.x, tile.y ) :: path)
 
 
 distance : ( Int, Int ) -> ( Int, Int ) -> Int
@@ -146,34 +347,23 @@ distance ( x1, y1 ) ( x2, y2 ) =
     round (sqrt (toFloat ((x2 - x1) ^ 2) + toFloat ((y2 - y1) ^ 2)))
 
 
-flightSystem : Logic.Component.Spec ( Int, Int ) Model -> Logic.Component.Spec (Maybe ( Int, Int )) Model -> Logic.Component.Spec Flight Model -> Logic.System.System Model
+flightSystem :
+    Logic.Component.Spec ( Int, Int ) Model
+    -> Logic.Component.Spec Goal Model
+    -> Logic.Component.Spec Flight Model
+    -> Logic.System.System Model
 flightSystem =
     Logic.System.step3
-        (\( ( x, y ), setPos ) ( goal, _ ) _ ->
+        (\( _, setPos ) ( goal, setGoal ) _ ->
             case goal of
-                Nothing ->
+                NoGoal ->
                     identity
 
-                Just ( goalX, goalY ) ->
-                    if x == goalX then
-                        setPos
-                            ( x
-                            , if y < goalY then
-                                y + 1
+                HasGoal [] _ ->
+                    setGoal NoGoal
 
-                              else
-                                y - 1
-                            )
-
-                    else
-                        setPos
-                            ( if x < goalX then
-                                x + 1
-
-                              else
-                                x - 1
-                            , y
-                            )
+                HasGoal (goalPos :: rest) goalId ->
+                    setGoal (HasGoal rest goalId) >> setPos goalPos
         )
 
 
@@ -191,9 +381,6 @@ view model =
                 |> List.map
                     (\( index, _ ) ->
                         let
-                            width =
-                                52
-
                             x =
                                 modBy width index
 
@@ -231,7 +418,7 @@ view model =
                         :: result
                 )
                 model.position
-                model.food
+                model.nectar
                 []
                 |> Canvas.shapes
                     [ Canvas.Settings.stroke Color.darkGreen
